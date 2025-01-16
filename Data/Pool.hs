@@ -33,6 +33,7 @@ module Data.Pool
     , LocalPool
     , createPool
     , withResource
+    , withResourceAndRetry
     , takeResource
     , tryWithResource
     , tryTakeResource
@@ -41,7 +42,6 @@ module Data.Pool
     , destroyAllResources
     ) where
 
-import Control.Applicative ((<$>))
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, onException, mask_)
@@ -263,6 +263,46 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
   return ret
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE withResource #-}
+#endif
+
+-- | Temporarily take a resource from a 'Pool', perform an action with
+-- it, and return it to the pool afterwards.
+--
+-- * If the pool has an idle resource available, it is used
+--   immediately.
+--
+-- * Otherwise, if the maximum number of resources has not yet been
+--   reached, a new resource is created and used.
+--
+-- * If the maximum number of resources has been reached, this
+--   function blocks until a resource becomes available.
+--
+-- Caution : This function upon any error while taking a bad resource
+-- will destroy the bad resource and will create a new resource in the
+-- same local and keeps it back in the pool.
+
+withResourceAndRetry ::
+#if MIN_VERSION_monad_control(0,3,0)
+    (MonadBaseControl IO m)
+#else
+    (MonadControlIO m)
+#endif
+  => Pool a -> (a -> m b) -> m b
+{-# SPECIALIZE withResourceAndRetry :: Pool a -> (a -> IO b) -> IO b #-}
+withResourceAndRetry pool@Pool{..} act = control $ \runInIO -> mask $ \restore -> do
+  (resource, local@LocalPool{..}) <- takeResource pool
+  ret' <- E.try $ restore (runInIO (act resource))
+  case ret' of
+    Right r -> putResource local resource *> pure r
+    Left (_ :: SomeException) -> do
+      destroy resource `E.catch` \(_::SomeException) -> return ()
+      resource' <- liftBase . join . atomically $
+        return $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
+      return' <- restore (runInIO (act resource')) `onException` destroyResource pool local resource'
+      putResource local resource'
+      pure return'
+#if __GLASGOW_HASKELL__ >= 700
+{-# INLINABLE withResourceAndRetry #-}
 #endif
 
 -- | Take a resource from the pool, following the same results as
